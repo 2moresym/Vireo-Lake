@@ -1,0 +1,519 @@
+==============================================================================
+VIREO (graphics API) + LAKE (renderer)
+Architecture and AI build prompt
+==============================================================================
+
+This file has two parts:
+
+  PART 1  The architecture (the design decisions).
+  PART 2  A prompt to give an AI coding agent. Give the agent the WHOLE file:
+          the prompt refers to Part 1.
+
+Status legend used in this file:
+  [DECIDED]  chosen by the project owner.
+  [DEFAULT]  a sensible default; change freely.
+  [VERIFY]   a hardware or ecosystem fact that must be checked against the
+             Intel PRM or the Mesa source before code depends on it.
+
+
+==============================================================================
+PART 1 - ARCHITECTURE
+==============================================================================
+
+1. GOALS AND NON-GOALS
+----------------------
+
+Goals
+  - Vireo: a from-scratch, Vulkan-style explicit graphics API. Low CPU
+    overhead (no OpenGL-style hidden state tracking, no per-draw driver
+    work), general purpose (2D, 3D, particles, compute).                [DECIDED]
+  - First target GPU: Intel HD 4000 (Ivy Bridge, Gen7, 16 EUs) on Linux.
+    Machine is a low-end laptop with 4 GB RAM shared with the GPU.      [DECIDED]
+  - Lake: a renderer built on top of Vireo (frame graph, 2D, 3D,
+    particles). Lake is the first and main client of Vireo.            [DECIDED]
+  - Reuse Vulkan DESIGN ideas (dynamic rendering, synchronization2-style
+    barriers, timeline semaphores, push descriptors, pipeline cache) and
+    reuse Mesa's Intel code (compiler, packet descriptions) where it is
+    licence-compatible. Do NOT reimplement Vulkan extensions as such: they
+    are spec text for another API.                                     [DECIDED]
+  - Other architectures will be added LATER. The design must have a clean
+    backend seam so a second backend does not require rewriting the core.
+                                                                        [DECIDED]
+
+Non-goals (for now)
+  - Windows/macOS. Linux only.
+  - Vulkan/OpenGL compatibility. (A translation layer could come much later.)
+  - Mesh shaders, ray tracing, native 16-bit math (HD 4000 has none).
+  - Async compute (Gen7 has a single render engine plus a blitter). [VERIFY]
+
+
+2. LAYERS
+---------
+
+    +----------------------------------------------------------+
+    |  Lake (Rust)                                             |
+    |  frame graph, 2D, 3D, particles, materials               |
+    +----------------------------------------------------------+
+                               |
+                               v
+    +----------------------------------------------------------+
+    |  vireo.h  (C ABI, stable, versioned)                     |
+    +----------------------------------------------------------+
+                               |
+                               v
+    +----------------------------------------------------------+
+    |  Vireo core (Zig)  - backend-agnostic                    |
+    |  recorder | pipelines | descriptors | memory | sync      |
+    |  capability/limits query, extension registry             |
+    +----------------------------------------------------------+
+                               |
+                               v
+    +----------------------------------------------------------+
+    |  BACKEND INTERFACE  (the seam; see section 6)            |
+    +----------------------------------------------------------+
+         |                       |                      |
+         v                       v                      v
+    +-----------+         +-------------+        +----------------+
+    | gen7      |         | null        |        | future         |
+    | (Zig)     |         | (Zig)       |        | (other Intel   |
+    | first     |         | test/CI     |        | gens, others)  |
+    +-----------+         +-------------+        +----------------+
+         |
+         v
+    kernel interface (Linux i915 DRM: GEM, execbuf, syncobj)   -> HD 4000
+
+  Side component: shader compiler shim (C ABI wrapper over Mesa's Intel
+  compiler). It feeds pipeline creation; it is owned by the backend that
+  needs it, not by the core.
+
+
+3. LANGUAGE SPLIT                                                      [DECIDED]
+-----------------
+
+  C     - vireo.h (the public ABI) and the thin shim around Mesa's compiler.
+          Mesa's compiler is C++, so the shim is a small C++ file exposing
+          extern "C" functions.
+  Zig   - Vireo core, all backends, packet packing, kernel interface.
+          Everything on the hot path lives in Zig. Zig 0.16 is installed;
+          the Zig std API changes between versions, so always check the
+          installed version's std instead of relying on memory.
+  Rust  - Lake, the validation layer, offline tools (shader precompiler,
+          pipeline cache builder). Lake talks to Vireo ONLY through vireo.h,
+          via a safe Rust wrapper crate ("vireo-rs").
+
+  Cross-language rule: keep calls across the C ABI flat (no allocation, no
+  callbacks in per-draw calls).
+
+
+4. PUBLIC API RULES (vireo.h)
+-----------------------------
+
+  - Prefix: Vr / vr / VR_  (e.g. vrCreateBuffer, VrBuffer).             [DEFAULT]
+  - Opaque handles (pointers to incomplete structs or 64-bit ids). No
+    exposed backend types.
+  - Flat structs with explicit sType-less, versioned layouts: every
+    descriptor struct starts with a `size` or `version` field so it can grow.
+  - No varargs, no C++ types, no callbacks except in explicit debug hooks.
+  - Errors are return codes (VrResult). No exceptions, no hidden globals.
+  - Everything explicit: the app creates and owns memory, pipelines,
+    descriptor sets, command buffers, sync objects.
+  - Capability model: the API has a BASELINE (everything Gen7 can do) plus
+    optional features/extensions, queried at runtime via a limits struct and
+    named extensions (VR_EXT_*). New hardware adds capability bits instead of
+    changing the baseline.
+
+  Core object set (first version):
+    Instance, Device, Queue, Memory (allocation), Buffer, Image, ImageView,
+    Sampler, ShaderModule, Pipeline (graphics, compute), DescriptorLayout,
+    DescriptorSet, CommandBuffer, Fence/TimelineSemaphore, Surface/Swapchain
+    (export to dma-buf; window-system glue lives in Lake or a small
+    companion library).
+
+
+5. VIREO CORE MODULES (Zig, backend-agnostic)
+---------------------------------------------
+
+  recorder     Command recording API. Writes through a per-backend encoder
+               into a mapped batch buffer (bump pointer). No allocations per
+               draw.
+  pipelines    Pipeline creation: validates description, asks the shader
+               compiler for machine code, asks the backend to bake ALL
+               hardware state into an opaque blob. Binding a pipeline = copy
+               the blob's dwords into the batch.
+  descriptors  Layouts and sets. The backend decides the hardware form
+               (Gen7: surface states + binding tables).
+  memory       Heaps, allocations, suballocators, budget query. The core
+               owns policy (pools, alignment, lifetime); the backend owns
+               hardware specifics (tiling, caching modes).
+  sync         Fences, timeline semaphores, barrier descriptions. Barriers
+               are explicit and translated by the backend.
+  caps         Device limits, feature bits, extension registry.
+  debug        Object naming, debug hooks, counters.
+
+  Hard rule: NOTHING in the core may include or assume Gen7 concepts
+  (binding tables, 3DSTATE packets, i915 ioctls). If the core needs to know
+  something hardware-specific, it asks through the backend interface.
+
+
+6. THE BACKEND INTERFACE (the multi-architecture seam)
+------------------------------------------------------
+
+Design: a Zig struct of function pointers ("vtable") per backend, plus a
+build option to compile a single backend statically with no indirection.
+
+  - Runtime mode:  backend chosen at device creation (probe hardware, pick
+    the first backend whose probe succeeds). One indirect call per recorded
+    operation is acceptable.
+  - Static mode:   `zig build -Dbackend=gen7` monomorphizes the core against
+    one backend with comptime, so the vtable disappears from the hot path.
+    Use this for release builds and benchmarks.                        [DEFAULT]
+
+Backend responsibilities (the interface, conceptually):
+
+  probe / open        Detect a supported device, open it, report identity.
+  caps                Fill limits, features, queue families, memory heaps,
+                      supported formats and tilings.
+  memory              Allocate/free device memory, map/unmap, choose caching
+                      mode, choose tiling for images, report image layout
+                      (size, alignment, pitch).
+  shaders             Declare which compiler it needs; consume compiled
+                      machine code; return per-stage metadata (register
+                      counts, binding usage).
+  pipelines           Build a backend blob from a pipeline description plus
+                      shader binaries (all hardware state pre-packed).
+  descriptors         Define set layout in hardware terms; write descriptors;
+                      produce bindable form.
+  encoder             Record: begin/end, bind pipeline, bind descriptors,
+                      bind vertex/index buffers, push constants, set dynamic
+                      state, draw, draw indexed, dispatch, copy, fill,
+                      clear, barrier, begin/end rendering (dynamic
+                      rendering), timestamp.
+  submit              Turn command buffers into a submission; relocation
+                      handling; signal/wait sync objects.
+  sync                Fence/timeline creation, wait, query.
+  present-export      Export an image as a dma-buf for the window system.
+  debug               Hang detection, error decoding, counters.
+
+Rules:
+  - The core never inspects a backend blob; it only stores and hands it back.
+  - Everything the API exposes must be expressible through capability bits,
+    so a weaker backend can say "not supported".
+  - A "null" backend (no GPU) is mandatory: it implements the interface with
+    a CPU-side recorder that only validates/logs. It lets the core, the
+    validation layer, Lake and CI run without hardware.               [DEFAULT]
+  - A "reference" software rasteriser backend is a possible later addition
+    for correctness comparison.
+
+Candidate future backends (informational, not planned work):
+  - Other Intel generations. Mesa's older-hardware compiler ("elk") covers
+    Gen4-Gen8 and the newer compiler ("brw") covers Gen9+.            [VERIFY]
+  - Other vendors via their Linux kernel interfaces.
+
+
+7. GEN7 BACKEND (HD 4000) - HARDWARE REALITIES
+----------------------------------------------
+
+Everything here is [VERIFY] against the Ivy Bridge PRM volumes (command
+stream, 3D pipeline, EU ISA/shared functions) and against Mesa's
+`hasvk`/`crocus`/`elk` sources. Never guess bit layouts.
+
+  - Resource access is through binding tables + surface states, not bindless.
+    Descriptor sets therefore compile to prebuilt surface-state and
+    binding-table chunks.
+  - GPU address space is about 2 GB (aliasing PPGTT). Plan on 32-bit GPU
+    addresses. Softpin needs full PPGTT, which is unreliable on Ivy Bridge,
+    so expect to use relocations in execbuf.
+  - Queues: one render engine (3D + compute) and one blitter. Expose one
+    graphics/compute queue and one transfer queue. No async compute.
+  - Memory: unified with system RAM; the LLC is shared with the CPU. Offer
+    cached host-visible mappings (readback) and write-combined mappings
+    (uploads). Total RAM is small, so the memory budget is a first-class
+    query and suballocation is mandatory.
+  - Tiling: render targets and textures want X or Y tiling; scanout wants X
+    tiling or linear. The BACKEND chooses tiling at image creation; the app
+    does not.
+  - Workarounds: Gen7 needs PIPE_CONTROL stalls/flushes around certain state
+    changes. Keep them in ONE module (gen7/workarounds.zig), each entry
+    commented with its PRM section or Mesa source reference.
+  - Shader stages present in hardware: VS, HS, DS, GS, PS, compute. Vertex-
+    side stages on this generation are compiled by the vec4 backend of
+    Mesa's compiler; fragment and compute are scalar.                 [VERIFY]
+  - Not exposed: mesh shaders, ray tracing, native 16-bit math.
+  - Render passes buy nothing on this GPU (immediate-mode renderer). Use
+    dynamic rendering: begin/end rendering with attachments given at record
+    time.
+
+Packet packing:
+  - Do not hand-write every 3DSTATE_* / PIPE_CONTROL / MI_* bitfield.
+    Mesa's genxml has machine-readable Gen7 packet descriptions. Write a
+    small generator (Zig comptime or a script) that turns them into Zig
+    `packed struct` packers plus a pack function. Keep the generated files
+    checked in and note the Mesa commit they came from.
+
+
+8. SHADER COMPILER STRATEGY
+---------------------------
+
+  - Vireo's shader input is SPIR-V.                                    [DEFAULT]
+  - Pipeline: SPIR-V -> NIR (Mesa) -> Intel compiler (elk for Gen7) ->
+    machine code + metadata. The user intends to modify Mesa's compiler for
+    the HD 4000.                                                       [DECIDED]
+  - Integration: a small C-ABI shim library (`vireo-shc`) wrapping the parts
+    of Mesa needed. Mesa is MIT-licensed; keep headers, record provenance
+    (Mesa commit) in a PROVENANCE file, keep modifications in a clearly
+    marked patch series or fork.
+  - Extracting the compiler from Mesa may be non-trivial (it depends on NIR
+    and Mesa utility code). Expect to vendor a pinned Mesa checkout and build
+    only the needed targets. Decide the exact approach in the milestone that
+    introduces it, and record the decision.                            [VERIFY]
+  - Early bring-up must NOT wait for the compiler: use hand-assembled EU
+    code first (Mesa's tree includes an assembler and disassembler tool for
+    the older-hardware compiler; verify target names).                 [VERIFY]
+  - Shaders are compiled at pipeline creation; a pipeline cache (on disk)
+    stores results keyed by shader hash + hardware id + compiler version.
+
+
+9. KERNEL INTERFACE (Gen7 backend)
+----------------------------------
+
+  - Use the render node (/dev/dri/renderD*), not the primary node. This
+    avoids display-master conflicts, so tests cannot black out the desktop by
+    themselves.                                                        [DEFAULT]
+  - Use the i915 uAPI directly (Zig @cImport of i915_drm.h): context create,
+    GEM create/mmap/caching/tiling, execbuf2, GEM wait, syncobj for
+    fences/timeline. Do not depend on libdrm's Intel buffer manager.
+  - A GPU hang bans the offending context and can trigger a GPU reset that
+    makes the compositor flicker. Hang handling is part of the backend:
+    detect the ban/reset, mark the device lost, return VR_ERROR_DEVICE_LOST.
+  - Keep the kernel interface in its own Zig module
+    (backends/gen7/kernel_i915.zig) so another kernel driver could be
+    substituted.
+
+
+10. HOW LOW CPU OVERHEAD IS ACHIEVED
+------------------------------------
+
+  1. Pipeline objects bake ALL hardware state; binding is a memcpy.
+  2. Command buffer = bump pointer into a mapped batch BO. No per-draw
+     allocation, no per-draw hash lookups.
+  3. No implicit hazard tracking. Barriers are explicit (synchronization2
+     style); Lake's frame graph computes them once per frame.
+  4. Descriptors are prebuilt hardware chunks; binding a set is pointer work.
+  5. Validation is a separate layer (Rust), absent from release builds.
+  6. Long-lived pooled buffers with suballocation. No create/destroy in the
+     frame loop. One execbuf per queue submission.
+  7. Relocation lists are reused/pre-sized; no growth on the hot path.
+  8. Static-backend build removes vtable indirection (section 6).
+
+
+11. LAKE (RENDERER, Rust)
+-------------------------
+
+  - Talks to Vireo only through vireo-rs (safe wrapper over vireo.h). The
+    wrapper encodes lifetimes so handle misuse fails to compile.
+  - Frame graph: passes declare resource reads/writes; Lake computes
+    barriers, aliasing, and lifetimes once per frame, then records.
+  - Renderers on top: 2D (batched quads, sprites, text), 3D (forward
+    renderer first; deferred is out of scope for HD 4000), particles
+    (CPU-simulated first, compute later).
+  - Presentation: render to images, export as dma-buf, present through
+    Wayland linux-dmabuf. Window-system code lives in Lake (or a companion
+    crate), never in Vireo core.
+  - Lake must run on the null backend for tests.
+
+
+12. VULKAN IDEAS: BORROW vs SKIP
+--------------------------------
+
+  Borrow (as design):
+    dynamic rendering; synchronization2-style barriers; timeline semaphores
+    (mapped to DRM syncobj); push descriptors / descriptor-buffer style
+    binding; pipeline cache; buffer-device-address-style GPU pointers
+    (32-bit on Gen7).
+  Skip:
+    render passes/subpasses; mesh shaders; ray tracing; anything needing
+    64-bit stateless addressing or 16-bit arithmetic on Gen7.
+
+
+13. REPOSITORY LAYOUT                                                  [DEFAULT]
+---------------------
+
+  vireo/
+    build.zig                 top-level build (Zig)
+    include/vireo.h           public C ABI
+    core/                     backend-agnostic Zig core
+    backends/
+      backend.zig             the backend interface definition
+      null/                   CPU-only test backend
+      gen7/
+        kernel_i915.zig       i915 ioctl layer
+        packets_gen.zig       GENERATED packers (from Mesa genxml)
+        workarounds.zig
+        encoder.zig, pipeline.zig, descriptors.zig, memory.zig, submit.zig
+    shc/                      shader compiler shim (C++/C, wraps Mesa)
+    tools/
+      genxml-gen/             packet generator
+      testbox/                safe hardware test runner (section 15)
+    lake/                     Rust workspace: lake, vireo-rs, validation
+    docs/                     design notes, PROVENANCE, decisions log
+    third_party/              pinned Mesa (submodule) if needed
+
+
+14. MILESTONES (each needs the stated evidence before moving on)
+----------------------------------------------------------------
+
+  M0  Skeleton: build.zig, vireo.h stub, backend interface, null backend.
+      Evidence: `zig build test` passes; a C test program creates and
+      destroys a Device on the null backend.
+  M1  Kernel layer: open render node, create GEM buffer, mmap, write/read,
+      close. Evidence: test prints the value read back; run under testbox.
+  M2  Submit path: execbuf a batch containing MI_STORE_DATA_IMM (and
+      MI_BATCH_BUFFER_END), with relocations, and wait. Evidence: GPU-written
+      value read back by CPU; deliberate bad batch produces a clean
+      DEVICE_LOST instead of a wedged process.
+  M3  Packet generator: genxml -> Zig packers for MI_*, PIPE_CONTROL and the
+      minimal 3DSTATE_* set. Evidence: unit tests compare packed dwords to
+      known-good dwords (from Mesa or the PRM), test names cite the source.
+  M4  First pixels: clear a render target and draw one triangle with
+      hand-assembled shaders. Evidence: image read back and written to a PPM
+      file; screenshot of the file in the repo docs.
+  M5  Real objects: pipeline objects, vertex/index buffers, descriptors,
+      textures, depth. Evidence: textured spinning cube dumped frame by
+      frame to PPM.
+  M6  Compiler shim: SPIR-V -> Gen7 machine code at pipeline creation, plus
+      the on-disk pipeline cache. Evidence: same cube, shaders from SPIR-V;
+      cache hit measurably faster on second run.
+  M7  Sync and queues: fences, timeline semaphores (syncobj), explicit
+      barriers, blitter transfer queue. Evidence: two-queue upload/render
+      test with a deterministic result.
+  M8  Lake bring-up: frame graph, 2D batcher, forward 3D, dma-buf export,
+      Wayland presentation. Evidence: window showing a Lake scene.
+  M9  Validation layer, counters, benchmarks against OpenGL on the same
+      machine. Evidence: table of draw-call cost and frame times.
+  M10 Backend seam proof: a second backend (or a software reference
+      backend) passes the M0-M5 tests through the same interface.
+      Evidence: same test binary, different backend, same results.
+
+
+15. SAFE HARDWARE TESTING (testbox)                                    [DECIDED]
+-----------------------------------
+
+The owner does not want tests to lock them into a black desktop. Therefore:
+
+  - All GPU tests run through `tools/testbox`, a small runner:
+      * runs each test in a child process with a hard timeout (default 10 s)
+        and kills it on timeout;
+      * uses the render node only; never opens the primary node and never
+        becomes DRM master;
+      * captures the kernel log (i915 hang/reset lines) before and after
+        each test and attaches the difference to the report;
+      * on a detected hang or reset, stops the run, prints what happened and
+        exits non-zero without running further GPU tests;
+      * by default refuses to run display/presentation tests; those need an
+        explicit `--display` flag and are meant to be started from a spare
+        TTY. Before any display test the runner records the current VT and
+        restores it on exit (including on failure).
+  - Never run experimental GPU code outside testbox.
+  - The null backend must let most work proceed with no GPU risk at all.
+
+
+16. KNOWN RISKS AND OPEN QUESTIONS
+----------------------------------
+
+  - Extracting Mesa's compiler into a standalone shim may be heavy.
+  - Ivy Bridge quirks (PPGTT, workarounds) can cost a lot of debugging time.
+  - Zig 0.16 std API differences from older docs and examples.
+  - Keeping Vireo's baseline honest: the baseline must not silently assume
+    Gen7-only behaviour, or the second backend will hurt.
+  - Wayland presentation details (modifiers, sync) are not designed here.
+
+
+==============================================================================
+PART 2 - PROMPT FOR THE AI CODING AGENT
+==============================================================================
+
+Copy everything from the next line down to the end of the file into the AI.
+Attach or paste PART 1 as well.
+
+------------------------------------------------------------------------------
+
+You are building Vireo (a from-scratch Vulkan-style graphics API) and Lake
+(a renderer on top of it) for Linux, first targeting the Intel HD 4000
+(Ivy Bridge, Gen7). PART 1 of this document is the architecture. Follow it.
+Where PART 1 marks something [DECIDED], do not change it. Where it marks
+[DEFAULT], follow it unless you have a concrete reason and you write that
+reason down in docs/decisions.md. Where it marks [VERIFY], you must check the
+fact against the Intel Ivy Bridge PRM or the Mesa source before writing code
+that depends on it.
+
+LANGUAGES AND TOOLS
+- Zig (installed version 0.16; run `zig version` and read the installed std
+  instead of assuming APIs), C for vireo.h and the shader-compiler shim,
+  Rust for Lake and tools. Linux only. Debian host with a Wayland compositor.
+- Work in a git repository. Commit after each passing checkpoint with a
+  message stating the milestone and the evidence.
+
+HOW TO WORK (very important)
+1. Work one milestone at a time, in the order of section 14. Do not start a
+   milestone until the previous one has its evidence.
+2. Before each milestone, write a short plan: files to create, the exact
+   test that proves it works, and which [VERIFY] facts you must check first.
+3. Implement concretely. No placeholder stubs that pretend to work: if
+   something is not implemented, make it return an explicit
+   VR_ERROR_UNSUPPORTED and add a test that shows it.
+4. After each milestone, show concrete evidence: the command you ran and its
+   real output. If a test fails, debug with explicit checkpoints (print or
+   log intermediate values, compare against known-good data) instead of
+   changing unrelated code.
+5. Never invent hardware facts. Every packet field, register value or
+   workaround you write must cite its source in a comment (PRM volume and
+   section, or Mesa file path and commit). If you cannot find a source,
+   write TODO(verify), stop, and ask me instead of guessing.
+6. Keep the core backend-agnostic. If you find yourself writing Gen7
+   concepts (binding tables, 3DSTATE, i915 ioctls) outside backends/gen7/,
+   stop and move the concept behind the backend interface (section 6).
+7. Hot path discipline (section 10): no allocation, no locking and no hash
+   lookups in recorder/bind/draw paths. If you need one, explain why in
+   docs/decisions.md first.
+8. Public API discipline (section 4): opaque handles, versioned flat structs,
+   return codes, no varargs or callbacks in per-draw calls.
+
+SAFETY RULES (non-negotiable)
+- Never run GPU code outside tools/testbox (section 15). Build testbox in
+  milestone M1, before any real GPU work, and use it for every GPU test.
+- Use the render node only. Never open the primary DRM node, never become
+  DRM master, never change VT, unless I explicitly pass a display flag.
+- Do not run commands that need root or modify system configuration
+  (kernel parameters, modprobe, GRUB, compositor settings) without asking me
+  first.
+- Do not download or execute anything other than pinned, named sources
+  (Mesa at a pinned commit; Intel PRM). Record versions and commits in
+  docs/PROVENANCE.
+
+REUSE AND LICENSING
+- Reuse Mesa's Intel code (elk compiler, genxml packet descriptions,
+  hasvk as a reference) as described in sections 7 and 8. Mesa is MIT
+  licensed: keep license headers, record the Mesa commit in docs/PROVENANCE,
+  and keep any modifications in a clearly marked patch series or fork.
+- Generated files (packets_gen.zig) must be reproducible from the generator
+  and the recorded Mesa commit.
+
+FIRST TASK (do this now, then stop and report)
+Complete milestone M0:
+- Create the repository skeleton from section 13.
+- Define the backend interface in backends/backend.zig (section 6), the
+  null backend, a minimal include/vireo.h with Instance/Device create and
+  destroy, and `zig build test`.
+- Show me: the directory tree, the backend interface, the output of
+  `zig build test`, and a small C program that creates and destroys a Device
+  on the null backend.
+- List every [VERIFY] item you expect to need in M1 and M2, and how you plan
+  to check each one.
+Then wait for my go-ahead before starting M1.
+
+WHEN YOU ARE UNSURE
+Ask one focused question with the options you see and your recommendation.
+Do not silently pick a design that contradicts PART 1.
+
+------------------------------------------------------------------------------
+END OF FILE
